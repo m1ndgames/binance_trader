@@ -11,12 +11,12 @@ use Config::IniFiles;
 my $price;
 my $newprice;
 my $last_buy_price;
+my $sell_price;
+my $buy_trigger_counter = 0;
+my $sell_trigger_counter = 0;
 my $cfg = Config::IniFiles->new( -file => "binance.cfg" );
 
-my $pair = $cfg->val('token', 'pair');
-my $token = $cfg->val('token', 'token');
 my $currency = $cfg->val('token', 'currency');
-my $min_change = $cfg->val('base', 'change_limit');
 my $timer = $cfg->val('base', 'timer');
 
 my $api = Binance::API->new(
@@ -62,6 +62,7 @@ sub read_buy_price {
                 return $saved_price;
         } else {
                 $last_buy_price = undef;
+                $sell_price = undef;
         }
 }
 
@@ -85,7 +86,7 @@ sub update_currency_balance {
 
 sub validate_open_orders {
         my $orders = $api->open_orders(
-                symbol => $pair
+                symbol => $cfg->val('token', 'pair')
         );
 
         if ($orders) {
@@ -98,17 +99,18 @@ sub validate_open_orders {
                                         if ($orders->[$s]->{'clientOrderId'} =~ /auto_buy_order/) {
                                                 $log->warn("Found old buy order, deleting...");
                                                 $api->cancel_order(
-                                                        symbol => $pair,
+                                                        symbol => $cfg->val('token', 'pair'),
                                                         orderId => $order_id,
                                                         recvWindow => 5000
                                                 );
                                                 $last_buy_price = undef;
+                                                $sell_price = undef;
                                                 unlink("binance.data");
 
                                         } elsif ($orders->[$s]->{'clientOrderId'} =~ /auto_sell_order/) {
                                                 $log->warn("Found old sell order, deleting...");
                                                 $api->cancel_order(
-                                                        symbol => $pair,
+                                                        symbol => $cfg->val('token', 'pair'),
                                                         orderId => $order_id,
                                                         recvWindow => 5000
                                                 );
@@ -123,7 +125,7 @@ sub buy_order {
         my $currency_amount = shift;
         my $client_orderid = "auto_buy_order_" . int(rand(9999));
         my $api_response = $api->order(
-                symbol => $pair,
+                symbol => $cfg->val('token', 'pair'),
                 side   => 'BUY',
                 type   => 'MARKET',
                 quoteOrderQty => $currency_amount,
@@ -131,9 +133,9 @@ sub buy_order {
                 newOrderRespType => 'FULL',
                 test => $cfg->val('base', 'testmode')
         );
-        print Dumper $api_response;
         if ($api_response->{'fills'}) {
                 &write_buy_price($api_response->{'fills'}[0]->{'price'});
+                $buy_trigger_counter = 0;
                 return 1;
         } elsif ($api_response->decoded_content =~ /MIN_NOTIONAL/) {
                 $log->warn("Buy order failed: Order too low (10€ minimum)");
@@ -144,20 +146,22 @@ sub sell_order {
         my $order_price = shift;
         my $order_amount = shift;
         my $client_orderid = "auto_sell_order_" . int(rand(9999));
+        $order_price += 0;
+
         my $api_response = $api->order(
-                symbol => $pair,
+                symbol => $cfg->val('token', 'pair'),
                 side   => 'SELL',
                 type   => 'LIMIT',
                 timeInForce => 'GTC',
-                quantity => $order_amount,
+                quantity => int($order_amount),
                 price => $order_price,
                 newOrderRespType => 'FULL',
                 newClientOrderId => $client_orderid,
                 test => $cfg->val('base', 'testmode')
         );
-        print Dumper $api_response;
+        #print Dumper $api_response;
         if ($api_response->{'orderId'}) {
-                print $api_response->decoded_content;
+                $sell_trigger_counter = 0;
                 return 1;
         } else {
                 if ($api_response->decoded_content =~ /MIN_NOTIONAL/) {
@@ -171,44 +175,76 @@ sub order_handler {
         my $type = shift;
 
         # Get tradin pair Balance
-        my ($currency_balance_free, $currency_balance_locked, $token_balance_free, $token_balance_locked) = &update_currency_balance($currency, $token);
-        my $change = ($price - $newprice);
-        $last_buy_price = &read_buy_price();
-        if (!$last_buy_price) {
-                $log->error("Error! I dont know the last buy price... please sort this out!");
-                exit 0;
-        }
-
-        chomp($last_buy_price);
-        my $sell_price = ($last_buy_price + $cfg->val('base', 'minimum_profit'));
-
-        $log->info("$token Price:\t$price\tChange: " . sprintf("%.5f", $change));
-        if (!$last_buy_price) {
-                $log->info("$currency: " . sprintf("%.2f", $currency_balance_free) . "  $token: " . sprintf("%.2f", $token_balance_free));
+        my ($currency_balance_free, $currency_balance_locked, $token_balance_free, $token_balance_locked) = &update_currency_balance($currency, $cfg->val('token', 'token'));
+        my $change = abs($price - $newprice);
+        if ($type eq 'SELL') {
+                $log->info($cfg->val('token', 'token') . " Price:\t$newprice\tChange: +$change");
         } else {
-                $log->info("$currency: " . sprintf("%.2f", $currency_balance_free) . "  $token: " . sprintf("%.2f", $token_balance_free) . " Buy price: $last_buy_price  Sell price: $sell_price");
+                $log->info($cfg->val('token', 'token') . " Price:\t$newprice\tChange: -$change");
         }
 
-        if (($type eq 'BUY') and ($currency_balance_free > 10)) {
+        $last_buy_price = &read_buy_price();
+        if ($last_buy_price) {
+                chomp($last_buy_price);
+                $sell_price = ($last_buy_price + $cfg->val('base', 'minimum_profit'));
+        }
+
+        if (($type eq 'SELL') and ($change > $cfg->val('base', 'change_limit'))) {
+                $sell_trigger_counter = $sell_trigger_counter + 1;
+                $buy_trigger_counter = 0;
+        }
+        if (($type eq 'BUY') and ($change > $cfg->val('base', 'change_limit')) and ($newprice < $cfg->val('base', 'max_price'))) {
+                $buy_trigger_counter = $buy_trigger_counter + 1;
+                $sell_trigger_counter = 0;
+        }
+
+
+        if (!$last_buy_price) {
+                $log->info("$currency: $currency_balance_free " . $cfg->val('token', 'token') . ": $token_balance_free Buy Trigger: $buy_trigger_counter/" . $cfg->val('base', 'buy_trigger'));
+        } else {
+                $log->info("$currency: $currency_balance_free " . $cfg->val('token', 'token') . ": $token_balance_free Buy price: $last_buy_price Sell price: $sell_price Sell Trigger: $sell_trigger_counter/" . $cfg->val('base', 'sell_trigger'));
+        }
+
+        if ((($type eq 'BUY') or ($type eq 'SELL')) and ($token_balance_free > 1) and ($last_buy_price < ($cfg->val('base', 'take_profit') + $last_buy_price))) {
+                my $sell_order_action = &sell_order($newprice, $token_balance_free);
+                if ($sell_order_action == 1) {
+                        $log->info("Selling " . $token_balance_free . $cfg->val('token', 'token') . " for $newprice");
+                        &send_telegram_message("Selling " . $token_balance_free . $cfg->val('token', 'token') . " for $newprice");
+                        $last_buy_price = undef;
+                        $sell_price = undef;
+                        $sell_trigger_counter = 0;
+                        unlink("binance.data");
+                }
+        } elsif (($type eq 'BUY') and ($currency_balance_free > 10) and ($newprice < $cfg->val('base', 'max_price'))) {
                 my $buy_change = ($newprice - $price);
-                if ($buy_change > $min_change) {
-                        my $buy_order_action = &buy_order($currency_balance_free);
-                        if ($buy_order_action == 1) {
-                                $log->info("Buying $token for $price \($currency_balance_free $currency\))");
-                                &send_telegram_message("Buying $token for $price \($currency_balance_free $currency\))");
+                if ($change > $cfg->val('base', 'change_limit')) {
+                        if ($buy_trigger_counter >= $cfg->val('base', 'buy_trigger')) {
+                                my $buy_order_action = &buy_order($currency_balance_free);
+                                if ($buy_order_action == 1) {
+                                        $log->info("Buying " . $cfg->val('token', 'token') . " for $price \($currency_balance_free $currency\))");
+                                        &send_telegram_message("Buying " . $cfg->val('token', 'token') . " for $price \($currency_balance_free $currency\))");
+                                }
                         }
                 }
+        } elsif (($type eq 'SELL') and ($token_balance_free > 1)) {
+                if (!$last_buy_price) {
+                        $log->error("Error! I dont know the last buy price... please sort this out!");
+                        exit 0;
+                }
 
-        } elsif (($type eq 'SELL') and ($token_balance_free > 15)) {
                 my $sell_change = ($price - $newprice);
-                if (($newprice > $sell_price) and ($token_balance_free > 1)) {
-                        if ($sell_change > $min_change) {
-                                my $sell_order_action = &sell_order($price, $token_balance_free);
-                                if ($sell_order_action == 1) {
-                                        $log->info("Selling " . $token_balance_free . "$token for $price");
-                                        &send_telegram_message("Selling " . $token_balance_free . "$token for $price");
-                                        $last_buy_price = undef;
-                                        unlink("binance.data");
+                if ($newprice > $sell_price) {
+                        if ($change > $cfg->val('base', 'change_limit')) {
+                                if ($sell_trigger_counter >= $cfg->val('base', 'sell_trigger')) {
+                                        my $sell_order_action = &sell_order($newprice, $token_balance_free);
+                                        if ($sell_order_action == 1) {
+                                                $log->info("Selling " . $token_balance_free . $cfg->val('token', 'token') . " for $newprice");
+                                                &send_telegram_message("Selling " . $token_balance_free . $cfg->val('token', 'token') . " for $newprice");
+                                                $last_buy_price = undef;
+                                                $sell_price = undef;
+                                                $sell_trigger_counter = 0;
+                                                unlink("binance.data");
+                                        }
                                 }
                         }
                 }
@@ -219,7 +255,7 @@ sub order_handler {
 
 # Start up info
 $log->info("Starting...");
-$log->info("Tradingpair is " . $pair . ". Minimum change is " . $min_change . ". Minimum profit is " . $cfg->val('base', 'minimum_profit') . ". Timer is set to " . $timer . " seconds.");
+$log->info("Tradingpair is " . $cfg->val('token', 'pair') . ". Minimum change is " . $cfg->val('base', 'change_limit') . ". Minimum profit is " . $cfg->val('base', 'minimum_profit') . ". Take profit at " . $cfg->val('base', 'take_profit') . ". Max price is " . $cfg->val('base', 'max_price') . ". Timer is set to " . $timer . " seconds.");
 if ($cfg->val('base', 'testmode') == 1) {
         $log->warn("Testmode is active - orders wont be executed");
 }
@@ -228,17 +264,19 @@ if ($cfg->val('base', 'testmode') == 1) {
 while (1) {
         # Get the new price
         if (!$price) {
-                $price = &update_token_price($pair);
+                $price = &update_token_price($cfg->val('token', 'pair'));
                 $newprice = $price;
                 next;
         } else {
-                $newprice = &update_token_price($pair);
+                $newprice = &update_token_price($cfg->val('token', 'pair'));
         }
 
         # Start the order handler
-        if ($price > $newprice) {
+        if ($newprice > $price) {
+                $buy_trigger_counter = 0;
                 &order_handler('SELL');
-        } elsif ($price < $newprice) {
+        } elsif ($price > $newprice) {
+                $sell_trigger_counter = 0;
                 &order_handler('BUY');
         }
 
